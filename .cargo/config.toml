@@ -1,0 +1,6 @@
+# Custom cargo subcommands, backed by the tasks in ./xtask (cargo-xtask pattern).
+[alias]
+xtask = "run -p xtask --"
+# Line and region coverage must stay at 100%; pass `--fail-under <PCT>` or
+# `--fail-under-regions <PCT>` again to override.
+coverage = "run -p xtask -- coverage --fail-under 100 --fail-under-regions 100"
