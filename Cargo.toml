@@ -4,6 +4,8 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Globally unique 128-bit IDs from a replicated, pluggable consensus backend"
+license = "Apache-2.0"
+repository = "https://github.com/juanmaneo/quorid"
 
 [dependencies]
 axum = "0.8"

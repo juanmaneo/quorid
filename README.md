@@ -1,5 +1,8 @@
 # quorid
 
+[![CI](https://github.com/juanmaneo/quorid/actions/workflows/ci.yml/badge.svg)](https://github.com/juanmaneo/quorid/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **Quorum + ID**: globally unique **128-bit IDs** served by a replicated state
 machine with a **pluggable consensus backend**, rendered in compact text
 encodings (ASCII or emoji).
@@ -153,3 +156,10 @@ pattern: tasks live in the dependency-free `xtask` crate, and
 Line, region and function coverage are kept at 100%. `tests/cli.rs` runs the
 real binary, so `main.rs` is measured too. Error paths are tested by making
 the OS fail for real, e.g. a directory where a file is expected.
+
+CI (`.github/workflows/ci.yml`) runs the same three checks on every push and
+pull request: format + clippy, tests on Linux and macOS, and the coverage gate.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
