@@ -791,14 +791,20 @@ mod tests {
             self.connect();
         }
 
-        /// The one running node that leads.
+        /// The one running node that leads, once every running node has heard
+        /// from it. A node leads from the moment it has the votes, but the
+        /// others learn of it from its first heartbeat, a tick later: until
+        /// then they cannot say who leads, let alone forward anything.
         async fn leader(&self) -> NodeId {
-            wait_until("a single leader", || {
+            wait_until("a single leader that every node knows", || {
                 let leaders: Vec<NodeId> = (self.running())
                     .filter(|(_, node)| node.status().role == Role::Leader)
                     .map(|(id, _)| id)
                     .collect();
-                (leaders.len() == 1).then(|| leaders[0])
+                let leader = (leaders.len() == 1).then(|| leaders[0])?;
+                (self.running())
+                    .all(|(_, node)| node.server.node().leader() == Some(leader))
+                    .then_some(leader)
             })
             .await
         }
