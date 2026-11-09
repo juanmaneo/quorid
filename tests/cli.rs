@@ -1,29 +1,11 @@
 //! End-to-end tests of the `quorid` binary.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Output, Stdio};
+mod common;
 
-fn quorid() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_quorid"));
-    // Plain logs at the default level, whatever the developer's environment says.
-    cmd.env("NO_COLOR", "1").env_remove("RUST_LOG");
-    for var in [
-        "LISTEN",
-        "BACKEND",
-        "DATA_DIR",
-        "BLOCK_SIZE",
-        "FORMAT",
-        "NODE_ID",
-        "VOTERS",
-        "RAFT_LISTEN",
-        "PEERS",
-    ] {
-        cmd.env_remove(format!("QUORID_{var}"));
-    }
-    cmd
-}
+use std::path::Path;
+use std::process::Output;
+
+use common::{Server, quorid};
 
 fn run(args: &[&str]) -> Output {
     quorid().args(args).output().expect("failed to run quorid")
@@ -137,87 +119,6 @@ fn serve_raft_rejects_a_malformed_peer() {
         stderr.contains("expected ID=RAFT_ADDR[@CLIENT_ADDR], got \"2\""),
         "{stderr}"
     );
-}
-
-/// A running `quorid serve`, killed on drop if a test fails midway.
-struct Server {
-    child: Child,
-    logs: BufReader<ChildStdout>,
-    addr: String,
-}
-
-impl Server {
-    fn start(args: &[&str]) -> Server {
-        let mut child = quorid()
-            .arg("serve")
-            .args(["--listen", "127.0.0.1:0"])
-            .args(args)
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("failed to start quorid");
-        let mut logs = BufReader::new(child.stdout.take().unwrap());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = logs.read_line(&mut line).unwrap();
-            assert!(read > 0, "quorid exited before listening");
-            if line.contains("quorid listening") {
-                break;
-            }
-        }
-        let addr = line
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix("addr="))
-            .expect("listening log has an addr")
-            .to_string();
-        Server { child, logs, addr }
-    }
-
-    fn post(&self, path: &str) -> String {
-        let mut stream = TcpStream::connect(&self.addr).unwrap();
-        write!(
-            stream,
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            self.addr
-        )
-        .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        response
-    }
-
-    /// Posts until the node accepts writes: a Raft node first has to find or
-    /// become the leader, and answers `421 not_leader` meanwhile.
-    fn post_when_ready(&self, path: &str) -> String {
-        let start = std::time::Instant::now();
-        loop {
-            let response = self.post(path);
-            if !response.starts_with("HTTP/1.1 421") {
-                return response;
-            }
-            assert!(start.elapsed().as_secs() < 30, "no leader: {response}");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
-
-    /// Stops the server like Ctrl-C would and returns its remaining logs.
-    #[cfg(unix)]
-    fn interrupt(mut self) -> String {
-        let pid = self.child.id().to_string();
-        let sent = Command::new("kill").args(["-INT", &pid]).status().unwrap();
-        assert!(sent.success());
-        assert!(self.child.wait().unwrap().success());
-        let mut rest = String::new();
-        self.logs.read_to_string(&mut rest).unwrap();
-        rest
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 #[cfg(unix)]

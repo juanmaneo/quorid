@@ -1,0 +1,265 @@
+//! End-to-end tests of a Raft cluster: real `quorid` processes talking over
+//! real sockets, some of them killed.
+
+mod common;
+
+use std::collections::BTreeSet;
+use std::net::TcpListener;
+use std::time::{Duration, Instant};
+
+use common::{Server, http, split};
+use serde_json::Value;
+
+const DEADLINE: Duration = Duration::from_secs(30);
+
+/// A free port, free until somebody else takes it.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Nodes `1..=size` of one cluster, each with the same flags after a restart.
+struct Cluster {
+    dir: tempfile::TempDir,
+    /// `(client address, Raft address)` of every node.
+    addrs: Vec<(String, String)>,
+    nodes: Vec<Option<Server>>,
+}
+
+impl Cluster {
+    fn start(size: usize) -> Cluster {
+        let addrs = (0..size)
+            .map(|_| {
+                (
+                    format!("127.0.0.1:{}", free_port()),
+                    format!("127.0.0.1:{}", free_port()),
+                )
+            })
+            .collect();
+        let mut cluster = Cluster {
+            dir: tempfile::tempdir().unwrap(),
+            addrs,
+            nodes: Vec::new(),
+        };
+        for id in 1..=size {
+            let node = cluster.spawn(id);
+            cluster.nodes.push(Some(node));
+        }
+        cluster
+    }
+
+    fn spawn(&self, id: usize) -> Server {
+        let (client, raft) = &self.addrs[id - 1];
+        let voters = (1..=self.addrs.len())
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let data = self.dir.path().join(format!("node{id}"));
+        let mut args = vec![
+            "--backend".to_string(),
+            "raft".into(),
+            "--node-id".into(),
+            id.to_string(),
+            "--voters".into(),
+            voters,
+            "--raft-listen".into(),
+            raft.clone(),
+            "--data-dir".into(),
+            data.to_str().unwrap().into(),
+            "--block-size".into(),
+            "10".into(),
+            "--format".into(),
+            "decimal".into(),
+        ];
+        for (i, (client, raft)) in self.addrs.iter().enumerate() {
+            if i + 1 != id {
+                args.push("--peer".into());
+                args.push(format!("{}={raft}@{client}", i + 1));
+            }
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        Server::start_on(client, &args)
+    }
+
+    fn client_addr(&self, id: usize) -> &str {
+        &self.addrs[id - 1].0
+    }
+
+    fn kill(&mut self, id: usize) {
+        self.nodes[id - 1].take().expect("the node is down").kill();
+    }
+
+    fn restart(&mut self, id: usize) {
+        assert!(self.nodes[id - 1].is_none(), "the node is running");
+        self.nodes[id - 1] = Some(self.spawn(id));
+    }
+
+    fn running(&self) -> impl Iterator<Item = usize> + '_ {
+        (1..=self.nodes.len()).filter(|&id| self.nodes[id - 1].is_some())
+    }
+
+    /// The running node that leads, once there is exactly one.
+    fn wait_for_leader(&self) -> usize {
+        let start = Instant::now();
+        loop {
+            let leaders: Vec<usize> = self
+                .running()
+                .filter(|&id| status(self.client_addr(id))["backend"]["role"] == "leader")
+                .collect();
+            if let [leader] = leaders[..] {
+                return leader;
+            }
+            assert!(start.elapsed() < DEADLINE, "no single leader: {leaders:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Waits until every running node but `leader` follows `leader`.
+    fn wait_for_followers(&self, leader: usize) {
+        let start = Instant::now();
+        loop {
+            let following = self.running().filter(|&id| id != leader).all(|id| {
+                status(self.client_addr(id))["backend"]["leader"] == self.client_addr(leader)
+            });
+            if following {
+                return;
+            }
+            assert!(
+                start.elapsed() < DEADLINE,
+                "the nodes do not follow {leader}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+fn status(addr: &str) -> Value {
+    let response = http(addr, "GET", "/v1/status");
+    let (code, body) = split(&response);
+    assert_eq!(code, 200, "{response}");
+    serde_json::from_str(body).unwrap()
+}
+
+/// IDs from `addr`, or the error it answered.
+fn allocate(addr: &str, count: u64) -> Result<Vec<u128>, (u16, Value)> {
+    let response = http(addr, "POST", &format!("/v1/ns/users/ids?count={count}"));
+    let (code, body) = split(&response);
+    let body: Value = serde_json::from_str(body).unwrap();
+    if code != 200 {
+        return Err((code, body));
+    }
+    Ok(body["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().parse().unwrap())
+        .collect())
+}
+
+/// The IDs of every successful call, to check that no ID is handed out twice
+/// and that later calls get greater ones.
+#[derive(Default)]
+struct Issued {
+    all: BTreeSet<u128>,
+}
+
+impl Issued {
+    /// Records the IDs, none of which may have been issued before.
+    fn add(&mut self, ids: &[u128]) {
+        assert!(!ids.is_empty());
+        for id in ids {
+            assert!(self.all.insert(*id), "ID {id} was issued twice");
+        }
+    }
+
+    /// Whether every ID is greater than all the earlier ones.
+    fn after(&self, ids: &[u128]) -> bool {
+        let last = self.all.last().copied().unwrap_or(0);
+        ids.iter().all(|&id| id > last)
+    }
+}
+
+#[test]
+fn a_cluster_survives_losing_its_leader() {
+    let mut cluster = Cluster::start(3);
+    let mut issued = Issued::default();
+
+    let leader = cluster.wait_for_leader();
+    cluster.wait_for_followers(leader);
+    let ids = allocate(cluster.client_addr(leader), 3).unwrap();
+    assert_eq!(ids, [1, 2, 3]);
+    issued.add(&ids);
+
+    // A follower sends the client to the leader.
+    let follower = (1..=3).find(|&id| id != leader).unwrap();
+    let (code, body) = allocate(cluster.client_addr(follower), 1).unwrap_err();
+    assert_eq!(code, 421);
+    assert_eq!(body["error"], "not_leader");
+    assert_eq!(body["leader"], cluster.client_addr(leader));
+
+    // The leader dies, with the rest of its first block unused.
+    cluster.kill(leader);
+    let second = cluster.wait_for_leader();
+    assert_ne!(second, leader);
+    let ids = allocate(cluster.client_addr(second), 15).unwrap();
+    assert!(issued.after(&ids), "{ids:?}");
+    issued.add(&ids);
+
+    // It comes back as a follower, and serves nothing it should not.
+    cluster.restart(leader);
+    cluster.wait_for_followers(second);
+    let ids = allocate(cluster.client_addr(second), 15).unwrap();
+    assert!(issued.after(&ids), "{ids:?}");
+    issued.add(&ids);
+    let (code, _) = allocate(cluster.client_addr(leader), 1).unwrap_err();
+    assert_eq!(code, 421);
+}
+
+#[test]
+fn a_cluster_keeps_its_state_when_every_node_restarts() {
+    let mut cluster = Cluster::start(3);
+    let mut issued = Issued::default();
+
+    let leader = cluster.wait_for_leader();
+    for _ in 0..3 {
+        let ids = allocate(cluster.client_addr(leader), 25).unwrap();
+        assert!(issued.after(&ids), "{ids:?}");
+        issued.add(&ids);
+    }
+
+    for id in 1..=3 {
+        cluster.kill(id);
+    }
+    for id in 1..=3 {
+        cluster.restart(id);
+    }
+
+    let leader = cluster.wait_for_leader();
+    cluster.wait_for_followers(leader);
+    let ids = allocate(cluster.client_addr(leader), 25).unwrap();
+    assert!(issued.after(&ids), "{ids:?}");
+    issued.add(&ids);
+    assert_eq!(issued.all.len(), 100);
+}
+
+#[test]
+fn a_node_that_lost_its_majority_does_not_serve() {
+    let mut cluster = Cluster::start(3);
+    let leader = cluster.wait_for_leader();
+    cluster.wait_for_followers(leader);
+    allocate(cluster.client_addr(leader), 1).unwrap();
+
+    let others: Vec<usize> = (1..=3).filter(|&id| id != leader).collect();
+    for id in others {
+        cluster.kill(id);
+    }
+    // The first block is mostly unused, so IDs are still served from memory,
+    // but a new block cannot be committed without a majority.
+    let ids = allocate(cluster.client_addr(leader), 5).unwrap();
+    assert_eq!(ids, [2, 3, 4, 5, 6]);
+    let (code, _) = allocate(cluster.client_addr(leader), 20).unwrap_err();
+    assert_eq!(code, 503);
+}
