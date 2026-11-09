@@ -223,13 +223,15 @@ pub struct RaftBackend {
     timeout: Duration,
 }
 
+fn not_a_voter() -> Error {
+    Error::InvalidRequest("this node is not one of the voters, check --node-id and --voters".into())
+}
+
 /// Raft errors that say nothing about leadership.
 fn convert(e: lumen_raft::Error) -> Error {
     match e {
         lumen_raft::Error::Storage(message) => Error::Storage(message),
-        lumen_raft::Error::NotConfigured => Error::InvalidRequest(
-            "this node is not one of the voters, check --node-id and --voters".into(),
-        ),
+        lumen_raft::Error::NotConfigured => not_a_voter(),
         other => Error::Unavailable(format!("raft: {other}")),
     }
 }
@@ -239,6 +241,12 @@ impl RaftBackend {
     /// and starts its Raft server. The node first finds or becomes the leader
     /// in the background: until then writes fail with [`Error::NotLeader`].
     pub fn open(dir: impl AsRef<Path>, config: RaftConfig) -> Result<Self> {
+        // Raft accepts an empty list and then waits for a configuration to
+        // reach its log, which never happens here: the voters are static, and
+        // a node that waits forever does not fail visibly.
+        if config.voters.is_empty() {
+            return Err(not_a_voter());
+        }
         let storage = FileStorage::open(dir.as_ref()).map_err(convert)?;
         let node = Node::new(
             Config {
@@ -739,11 +747,13 @@ mod tests {
     fn startup_problems_are_reported() {
         let dir = tempfile::tempdir().unwrap();
 
-        let err = open_error(dir.path(), config(1, vec![2, 3]));
-        assert!(
-            err.starts_with("invalid request: this node is not one of the voters"),
-            "{err}"
-        );
+        for voters in [vec![], vec![2, 3]] {
+            let err = open_error(dir.path(), config(1, voters));
+            assert!(
+                err.starts_with("invalid request: this node is not one of the voters"),
+                "{err}"
+            );
+        }
 
         // The data directory is exclusive.
         let first = RaftBackend::open(dir.path(), config(1, vec![1])).unwrap();
