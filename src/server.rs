@@ -9,12 +9,16 @@
 //! | GET    | `/healthz`                    | liveness                                 |
 //!
 //! IDs are always JSON strings: JSON numbers cannot carry 128-bit integers.
+//!
+//! A node that forwards a write to the leader does it with a `/blocks` request
+//! that carries [`FORWARDED_HEADER`], which the receiving node serves without
+//! forwarding it any further.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,6 +32,10 @@ use crate::id::{IdRange, Namespace};
 
 /// Upper bound on IDs returned by one `/ids` call (use `/blocks` for more).
 pub const MAX_IDS_PER_REQUEST: u64 = 10_000;
+
+/// Set on the `/blocks` requests that one node sends another to forward a
+/// write: the receiver must not forward them again.
+pub const FORWARDED_HEADER: &str = "x-quorid-forwarded";
 
 pub struct AppState<B> {
     allocator: Arc<Allocator<B>>,
@@ -115,10 +123,15 @@ async fn lease_block<B: Backend>(
     State(state): State<AppState<B>>,
     Path(namespace): Path<String>,
     Query(query): Query<BlockQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<BlockResponse>, ApiError> {
     let namespace = Namespace::new(namespace)?;
     let size = query.size.unwrap_or(state.allocator.config().block_size);
-    let range = state.allocator.lease(&namespace, size).await?;
+    let range = if headers.contains_key(FORWARDED_HEADER) {
+        state.allocator.lease_here(&namespace, size).await?
+    } else {
+        state.allocator.lease(&namespace, size).await?
+    };
     Ok(Json(BlockResponse {
         namespace,
         count: range.len().to_string(),
@@ -250,7 +263,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::backend::MemoryBackend;
+    use crate::backend::{Backend, BackendStatus, MemoryBackend};
+    use crate::command::{Command, Outcome};
     use crate::state::IdState;
 
     fn app() -> Router {
@@ -315,6 +329,59 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    /// A node that is not the leader: it forwards what it is asked to, and
+    /// answers what was forwarded to it with a pointer to the leader.
+    struct Follower;
+
+    impl Backend for Follower {
+        async fn execute(&self, _: Command) -> crate::error::Result<Outcome> {
+            Ok(Outcome::Reserved(IdRange::new(7, 9)))
+        }
+
+        async fn execute_here(&self, _: Command) -> crate::error::Result<Outcome> {
+            Err(Error::NotLeader {
+                leader: Some("leader:7070".into()),
+            })
+        }
+
+        fn status(&self) -> BackendStatus {
+            MemoryBackend::new().status()
+        }
+    }
+
+    async fn forwarded(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let request = Request::post(uri)
+            .header(FORWARDED_HEADER, "1")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn forwarded_blocks_are_not_forwarded_again() {
+        // A backend that never forwards serves them like any other.
+        let (status, body) = forwarded(&app(), "/v1/ns/users/blocks?size=3").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["start"], "1");
+        assert_eq!(body["end"], "4");
+
+        let allocator = Allocator::new(Arc::new(Follower), AllocatorConfig::with_block_size(100));
+        let app = router(Arc::new(allocator), Format::Mania);
+        let (status, body) = call(&app, Method::POST, "/v1/ns/users/blocks").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["start"], "7");
+
+        let (status, body) = forwarded(&app, "/v1/ns/users/blocks").await;
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(body["leader"], "leader:7070");
+
+        let (status, _) = call(&app, Method::GET, "/v1/status").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn decode_and_status() {
         let app = app();
@@ -355,6 +422,9 @@ mod tests {
         let app = app_with(MemoryBackend::with_state(state));
 
         let (status, body) = call(&app, Method::POST, "/v1/ns/users/blocks?size=10").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "exhausted");
+        let (status, body) = forwarded(&app, "/v1/ns/users/blocks?size=10").await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "exhausted");
 

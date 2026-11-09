@@ -8,9 +8,11 @@
 //! the replicas stay identical, and after a restart the state is rebuilt from
 //! the latest snapshot and the log behind it.
 //!
-//! **Only the leader takes writes.** A follower answers [`Error::NotLeader`],
-//! with the leader's client address as the hint if it was given with
-//! [`Peer::client_addr`].
+//! **Only the leader takes writes**, but any node takes requests. A follower
+//! that knows the leader's client address ([`Peer::client_addr`]) forwards the
+//! command to it over HTTP and returns the leader's answer. Otherwise, and for
+//! a command that was forwarded already ([`Backend::execute_here`]), it
+//! answers [`Error::NotLeader`], with that address as the hint if it has one.
 //!
 //! **A caller is answered for its own entry only.** After a leader change, a
 //! different command can end up at the log index a caller was told about, so
@@ -47,7 +49,7 @@ use lumen_raft::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use super::{Backend, BackendStatus, Role};
+use super::{Backend, BackendStatus, Role, forward};
 use crate::command::{Command, Outcome};
 use crate::error::{Error, Result};
 use crate::state::IdState;
@@ -252,6 +254,7 @@ impl RaftBackend {
             Config {
                 election_timeout_min: config.election_ticks.0,
                 election_timeout_max: config.election_ticks.1,
+
                 ..Config::cluster(config.node_id, config.voters)
             },
             storage,
@@ -325,8 +328,11 @@ impl RaftBackend {
     }
 }
 
-impl Backend for RaftBackend {
-    async fn execute(&self, command: Command) -> Result<Outcome> {
+impl RaftBackend {
+    /// Appends `command` to the log, if this node leads, and waits for the
+    /// outcome. A follower with the leader's client address hands the command
+    /// to the leader instead, if `forward` allows it.
+    async fn run(&self, command: Command, forward: bool) -> Result<Outcome> {
         let seq = self.shared.next_seq.fetch_add(1, Ordering::Relaxed);
         let request = Request {
             node: self.shared.node_id,
@@ -346,10 +352,17 @@ impl Backend for RaftBackend {
 
         // The proposal writes the entry to disk and waits for the sync.
         let server = self.server.clone();
-        tokio::task::spawn_blocking(move || server.propose(data))
+        let proposed = tokio::task::spawn_blocking(move || server.propose(data))
             .await
             .map_err(Error::from)
-            .and_then(|proposed| proposed.map_err(|e| self.error(e)))?;
+            .and_then(|proposed| proposed.map_err(|e| self.error(e)));
+        // The hint is where the leader's clients go, which is where to forward.
+        if let Err(Error::NotLeader { leader: Some(addr) }) = &proposed
+            && forward
+        {
+            return forward::execute(addr, &request.command, self.timeout).await;
+        }
+        proposed?;
 
         // A dropped waiter (the node was replaced as leader, say) never
         // answers, which is a timeout like any other.
@@ -360,6 +373,16 @@ impl Backend for RaftBackend {
                 self.timeout
             ))),
         }
+    }
+}
+
+impl Backend for RaftBackend {
+    async fn execute(&self, command: Command) -> Result<Outcome> {
+        self.run(command, true).await
+    }
+
+    async fn execute_here(&self, command: Command) -> Result<Outcome> {
+        self.run(command, false).await
     }
 
     fn status(&self) -> BackendStatus {
@@ -390,6 +413,8 @@ mod tests {
     use lumen_raft::Storage;
 
     use super::*;
+    use crate::allocator::{Allocator, AllocatorConfig};
+    use crate::codec::Format;
     use crate::id::{IdRange, Namespace};
 
     fn users() -> Namespace {
@@ -468,7 +493,7 @@ mod tests {
     struct Cluster {
         dir: tempfile::TempDir,
         size: u64,
-        nodes: Vec<Option<RaftBackend>>,
+        nodes: Vec<Option<Arc<RaftBackend>>>,
     }
 
     impl Cluster {
@@ -479,7 +504,7 @@ mod tests {
                 nodes: Vec::new(),
             };
             for id in 1..=size {
-                cluster.nodes.push(Some(cluster.open(id)));
+                cluster.nodes.push(Some(Arc::new(cluster.open(id))));
             }
             cluster.connect();
             cluster
@@ -504,13 +529,13 @@ mod tests {
         }
 
         fn node(&self, id: NodeId) -> &RaftBackend {
-            self.nodes[id as usize - 1].as_ref().unwrap()
+            self.nodes[id as usize - 1].as_deref().unwrap()
         }
 
         fn running(&self) -> impl Iterator<Item = (NodeId, &RaftBackend)> {
             (1..)
                 .zip(&self.nodes)
-                .filter_map(|(id, node)| Some((id, node.as_ref()?)))
+                .filter_map(|(id, node)| Some((id, node.as_deref()?)))
         }
 
         fn stop(&mut self, id: NodeId) {
@@ -518,7 +543,7 @@ mod tests {
         }
 
         fn restart(&mut self, id: NodeId) {
-            self.nodes[id as usize - 1] = Some(self.open(id));
+            self.nodes[id as usize - 1] = Some(Arc::new(self.open(id)));
             self.connect();
         }
 
@@ -610,10 +635,10 @@ mod tests {
             if id == first {
                 assert_eq!((status.role, status.leader), (Role::Leader, None));
             } else {
-                // A follower sends clients to the leader.
+                // A follower tells where the leader's clients go.
                 let hint = Some(format!("node{first}:7070"));
                 assert_eq!((status.role, status.leader), (Role::Follower, hint.clone()));
-                let err = node.execute(reserve(1)).await.unwrap_err();
+                let err = node.execute_here(reserve(1)).await.unwrap_err();
                 assert!(matches!(err, Error::NotLeader { leader } if leader == hint));
             }
         }
@@ -638,6 +663,98 @@ mod tests {
         assert_eq!(cluster.leader().await, cluster.leader().await);
     }
 
+    /// An HTTP server in front of `backend`, like the one `quorid serve`
+    /// runs, and the task that runs it.
+    async fn serve(
+        backend: Arc<RaftBackend>,
+    ) -> (String, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let allocator = Allocator::new(backend, AllocatorConfig::with_block_size(100));
+        let app = crate::server::router(Arc::new(allocator), Format::Decimal);
+        let listener = tokio::net::TcpListener::bind(any_local()).await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(std::future::IntoFuture::into_future(axum::serve(
+            listener, app,
+        )));
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn followers_forward_writes_to_the_leader() {
+        let cluster = Cluster::start(3);
+        let leader = cluster.leader().await;
+        let follower_id = (1..=3).find(|&id| id != leader).unwrap();
+        let bystander = (1..=3)
+            .find(|&id| id != leader && id != follower_id)
+            .unwrap();
+
+        // Every node has an HTTP server, and every node knows where they are.
+        let mut fronts = HashMap::new();
+        for (id, _) in cluster.running() {
+            fronts.insert(
+                id,
+                serve(cluster.nodes[id as usize - 1].clone().unwrap()).await,
+            );
+        }
+        let tell = |node: NodeId, about: NodeId, client: Option<&str>| {
+            cluster.node(node).set_peer(Peer {
+                id: about,
+                raft_addr: cluster.node(about).local_addr(),
+                client_addr: client.map(str::to_string),
+            });
+        };
+        for node in 1..=3 {
+            for about in (1..=3).filter(|&about| about != node) {
+                tell(node, about, Some(&fronts[&about].0));
+            }
+        }
+        let leader_front = fronts[&leader].0.clone();
+        let follower = cluster.node(follower_id);
+
+        // The follower has the leader reserve the block, and sees the same
+        // outcomes: blocks, and refusals.
+        assert_eq!(lease(follower, 10).await, IdRange::new(1, 11));
+        let err = follower.execute(reserve(0)).await.unwrap_err();
+        assert_eq!(err.to_string(), "invalid request: count must be at least 1");
+        assert_eq!(lease(cluster.node(leader), 5).await, IdRange::new(11, 16));
+        cluster.converge(16).await;
+
+        // What was forwarded is not forwarded again.
+        let err = follower.execute_here(reserve(1)).await.unwrap_err();
+        assert_eq!(
+            format!("{err:?}"),
+            format!("NotLeader {{ leader: Some({leader_front:?}) }}")
+        );
+
+        // A follower that was sent to a node that is not the leader gets
+        // pointed to the leader, and stops there.
+        tell(follower_id, leader, Some(&fronts[&bystander].0));
+        let err = follower.execute(reserve(1)).await.unwrap_err();
+        assert_eq!(
+            format!("{err:?}"),
+            format!("NotLeader {{ leader: Some({leader_front:?}) }}")
+        );
+        assert_eq!(cluster.node(bystander).state().next_id(&users()), 16);
+
+        // Without a client address for the leader there is nowhere to forward.
+        tell(follower_id, leader, None);
+        let err = follower.execute(reserve(1)).await.unwrap_err();
+        assert_eq!(format!("{err:?}"), "NotLeader { leader: None }");
+
+        // And a leader whose server is down cannot be reached.
+        tell(follower_id, leader, Some(&leader_front));
+        let (_, server) = fronts.remove(&leader).unwrap();
+        server.abort();
+        let _ = server.await;
+        let err = follower.execute(reserve(1)).await.unwrap_err();
+        assert!(
+            err.to_string().starts_with(&format!(
+                "backend unavailable: cannot reach the leader at {leader_front}"
+            )),
+            "{err}"
+        );
+        assert_eq!(cluster.node(leader).state().next_id(&users()), 16);
+    }
+
     #[tokio::test]
     async fn a_leader_without_a_quorum_times_out() {
         let mut cluster = Cluster::start(3);
@@ -647,7 +764,7 @@ mod tests {
         }
 
         // It keeps leading until it hears of a higher term, but cannot commit.
-        let backend = cluster.nodes[leader as usize - 1].as_mut().unwrap();
+        let backend = Arc::get_mut(cluster.nodes[leader as usize - 1].as_mut().unwrap()).unwrap();
         backend.timeout = Duration::from_millis(100);
         let err = backend.execute(reserve(10)).await.unwrap_err();
         assert!(

@@ -130,10 +130,15 @@ quorid serve --backend raft --node-id 1 --voters 1,2,3 \
 
 * The Raft log and snapshots live in `<data-dir>/raft`. A single node
   (`--node-id 1 --voters 1`) is a valid cluster of one.
-* **Only the leader takes writes.** A follower answers `421 not_leader`, with
-  the leader's `CLIENT_ADDR` as the `leader` hint when the peer was given one
-  (`/v1/status` shows it too). Clients retry there. The `--peer` list may
-  include the node itself.
+* **Any node serves IDs, only the leader reserves blocks.** A follower that
+  needs a new block asks the leader for it over HTTP, at the leader's
+  `CLIENT_ADDR` (so give every peer one), and hands out IDs from it. Those
+  requests carry an `x-quorid-forwarded` header, and a node that receives one
+  never forwards it again: it serves the block or answers `421 not_leader`.
+  That is also what a follower answers when it cannot forward, because it has
+  no leader yet or does not know the leader's `CLIENT_ADDR`; the `leader` hint
+  of the 421 (also in `/v1/status`) tells clients where to retry. The `--peer`
+  list may include the node itself.
 * The voters are fixed on the command line: there is no membership change.
 * A block is committed after a majority has it on disk, so reserving one costs
   a few ticks (20 ms each by default). The segment allocator pays that once
@@ -156,7 +161,9 @@ IDs are always JSON **strings**: JSON numbers can't carry 128 bits.
 | GET    | `/healthz`                  |                                         |
 
 `/blocks` hands a raw range (`{"start":"101","end":"1000101",...}`, half-open)
-to clients that want to allocate locally themselves.
+to clients that want to allocate locally themselves. On a replicated backend a
+follower forwards it to the leader, unless the request has the
+`x-quorid-forwarded` header (see above).
 
 Errors are `{"error": "...", "message": "..."}` with status 400 (bad
 namespace/count/ID), 409 (namespace exhausted), 421 (`not_leader`, with a
@@ -170,7 +177,7 @@ Namespaces: 1–64 chars of `[a-z0-9_.-]`, starting with `[a-z0-9]`.
 |----------|:-------:|:----------:|---------------------------------------------|
 | `memory` | no      | no         | tests and demos                             |
 | `file`   | yes     | no         | atomic write + fsync per block, `LOCK` file |
-| `raft`   | yes     | yes        | LumenDB's `raft` crate; leader-only writes  |
+| `raft`   | yes     | yes        | LumenDB's `raft` crate; followers forward   |
 
 The `raft` backend depends on LumenDB through git (`Cargo.lock` pins the
 commit), which `cargo publish` to crates.io does not accept.
@@ -180,6 +187,7 @@ commit), which `cargo publish` to crates.io does not accept.
 ```rust
 pub trait Backend: Send + Sync + 'static {
     fn execute(&self, command: Command) -> impl Future<Output = Result<Outcome>> + Send;
+    fn execute_here(&self, command: Command) -> impl Future<Output = Result<Outcome>> + Send; // defaults to execute
     fn status(&self) -> BackendStatus;
 }
 ```
@@ -187,7 +195,9 @@ pub trait Backend: Send + Sync + 'static {
 `RaftBackend` (`src/backend/raft.rs`) is the reference for a replicated one:
 propose the command → when the entry commits, apply it with `IdState::apply`
 → resolve the waiting caller. Followers return `Error::NotLeader { leader }`
-(or forward). Snapshots are `IdState::snapshot()` / `IdState::restore()`.
+or forward the command to the leader (`execute`); `execute_here` is what
+serves a command that was already forwarded, and must never forward it again.
+Snapshots are `IdState::snapshot()` / `IdState::restore()`.
 Match a caller to its own entry with a unique tag (node, run, sequence) rather
 than the log index: after a leader change another command can sit at that
 index, and the wrong caller would get its range. Read the contract on

@@ -12,9 +12,14 @@
 //! log, and once the entry is committed apply it to the local
 //! [`IdState`](crate::IdState) with
 //! [`IdState::apply`](crate::IdState::apply) and resolve the caller's future
-//! with the outcome. [`RaftBackend`] is the reference for that.
+//! with the outcome. [`RaftBackend`] is the reference for that. A node that
+//! cannot take the write itself either fails with
+//! [`Error::NotLeader`](crate::Error::NotLeader) or forwards the command to the
+//! node that can, in which case it must serve forwarded commands with
+//! [`Backend::execute_here`].
 
 mod file;
+mod forward;
 mod memory;
 mod raft;
 
@@ -67,6 +72,15 @@ pub struct BackendStatus {
 ///    twice. Backends therefore need no client-level deduplication.
 pub trait Backend: Send + Sync + 'static {
     fn execute(&self, command: Command) -> impl Future<Output = Result<Outcome>> + Send;
+
+    /// Like [`execute`](Backend::execute), but never hands the command to
+    /// another node: one that cannot apply it itself fails with
+    /// [`Error::NotLeader`](crate::Error::NotLeader). It serves the commands
+    /// that another node already forwarded, which must not be forwarded again.
+    /// Backends that never forward need not override it.
+    fn execute_here(&self, command: Command) -> impl Future<Output = Result<Outcome>> + Send {
+        self.execute(command)
+    }
 
     fn status(&self) -> BackendStatus;
 }

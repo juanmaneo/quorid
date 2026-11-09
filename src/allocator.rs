@@ -78,6 +78,15 @@ impl<B: Backend> Allocator<B> {
         lease(&*self.backend, namespace, size).await
     }
 
+    /// Like [`Allocator::lease`], for a request that another node forwarded
+    /// here: a node that cannot reserve the block itself fails with
+    /// [`Error::NotLeader`] instead of forwarding it once more, so a request
+    /// never bounces between nodes that disagree on who leads.
+    pub async fn lease_here(&self, namespace: &Namespace, size: u64) -> Result<IdRange> {
+        let outcome = self.backend.execute_here(reserve(namespace, size)).await?;
+        Ok(reserved(outcome))
+    }
+
     pub async fn next_id(&self, namespace: &Namespace) -> Result<Id> {
         let ranges = self.allocate(namespace, 1).await?;
         Ok(ranges[0].start)
@@ -151,12 +160,20 @@ impl<B: Backend> Allocator<B> {
 }
 
 async fn lease<B: Backend>(backend: &B, namespace: &Namespace, count: u64) -> Result<IdRange> {
-    let command = Command::Reserve {
+    let outcome = backend.execute(reserve(namespace, count)).await?;
+    Ok(reserved(outcome))
+}
+
+fn reserve(namespace: &Namespace, count: u64) -> Command {
+    Command::Reserve {
         namespace: namespace.clone(),
         count,
-    };
-    match backend.execute(command).await? {
-        Outcome::Reserved(range) => Ok(range),
+    }
+}
+
+fn reserved(outcome: Outcome) -> IdRange {
+    match outcome {
+        Outcome::Reserved(range) => range,
     }
 }
 

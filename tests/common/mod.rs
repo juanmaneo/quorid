@@ -30,13 +30,22 @@ pub fn quorid() -> Command {
 
 /// Sends one request and returns the whole raw response.
 pub fn http(addr: &str, method: &str, path: &str) -> String {
+    http_with(addr, method, path, &[])
+}
+
+/// Like [`http`], with extra headers.
+pub fn http_with(addr: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> String {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
+    let headers: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n{headers}\r\n",
     )
     .unwrap();
     let mut response = String::new();

@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use common::{Server, http, split};
+use common::{Server, http, http_with, split};
 use serde_json::Value;
 
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -159,6 +159,19 @@ fn allocate(addr: &str, count: u64) -> Result<Vec<u128>, (u16, Value)> {
         .collect())
 }
 
+/// Asks `addr` for a block of IDs the way a follower asks the leader: with
+/// the header that forbids passing the request on again.
+fn block_without_forwarding(addr: &str) -> (u16, Value) {
+    let response = http_with(
+        addr,
+        "POST",
+        "/v1/ns/users/blocks?size=1",
+        &[("x-quorid-forwarded", "1")],
+    );
+    let (code, body) = split(&response);
+    (code, serde_json::from_str(body).unwrap())
+}
+
 /// The IDs of every successful call, to check that no ID is handed out twice
 /// and that later calls get greater ones.
 #[derive(Default)]
@@ -193,12 +206,19 @@ fn a_cluster_survives_losing_its_leader() {
     assert_eq!(ids, [1, 2, 3]);
     issued.add(&ids);
 
-    // A follower sends the client to the leader.
+    // A follower gets its blocks from the leader, so it serves too.
     let follower = (1..=3).find(|&id| id != leader).unwrap();
-    let (code, body) = allocate(cluster.client_addr(follower), 1).unwrap_err();
+    let ids = allocate(cluster.client_addr(follower), 1).unwrap();
+    assert!(issued.after(&ids), "{ids:?}");
+    issued.add(&ids);
+    // The leader is the only one to take a block directly: a follower that is
+    // asked on behalf of another one sends it to the leader instead.
+    let (code, body) = block_without_forwarding(cluster.client_addr(follower));
     assert_eq!(code, 421);
     assert_eq!(body["error"], "not_leader");
     assert_eq!(body["leader"], cluster.client_addr(leader));
+    let (code, _) = block_without_forwarding(cluster.client_addr(leader));
+    assert_eq!(code, 200);
 
     // The leader dies, with the rest of its first block unused.
     cluster.kill(leader);
@@ -208,14 +228,16 @@ fn a_cluster_survives_losing_its_leader() {
     assert!(issued.after(&ids), "{ids:?}");
     issued.add(&ids);
 
-    // It comes back as a follower, and serves nothing it should not.
+    // It comes back as a follower: it serves through the new leader, and
+    // never from the block it held when it died.
     cluster.restart(leader);
     cluster.wait_for_followers(second);
     let ids = allocate(cluster.client_addr(second), 15).unwrap();
     assert!(issued.after(&ids), "{ids:?}");
     issued.add(&ids);
-    let (code, _) = allocate(cluster.client_addr(leader), 1).unwrap_err();
-    assert_eq!(code, 421);
+    let ids = allocate(cluster.client_addr(leader), 1).unwrap();
+    assert!(issued.after(&ids), "{ids:?}");
+    issued.add(&ids);
 }
 
 #[test]
