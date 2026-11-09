@@ -4,7 +4,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use quorid::{Allocator, AllocatorConfig, Backend, FileBackend, Format, Id, MemoryBackend};
+use quorid::{
+    Allocator, AllocatorConfig, Backend, FileBackend, Format, Id, MemoryBackend, Peer, RaftBackend,
+    RaftConfig,
+};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -45,9 +48,23 @@ struct ServeArgs {
     listen: SocketAddr,
     #[arg(long, env = "QUORID_BACKEND", value_enum, default_value_t = BackendKind::File)]
     backend: BackendKind,
-    /// Directory for the `file` backend.
+    /// Directory for the `file` backend, and for the `raft` backend (in `raft/`).
     #[arg(long, env = "QUORID_DATA_DIR", default_value = "quorid-data")]
     data_dir: PathBuf,
+    /// This node's ID in the cluster (`raft` backend, required).
+    #[arg(long, env = "QUORID_NODE_ID")]
+    node_id: Option<u64>,
+    /// IDs of all voters, the same on every node and including this one
+    /// (`raft` backend, required).
+    #[arg(long, env = "QUORID_VOTERS", value_delimiter = ',')]
+    voters: Vec<u64>,
+    /// Address of the Raft transport (`raft` backend).
+    #[arg(long, env = "QUORID_RAFT_LISTEN", default_value = "127.0.0.1:7171")]
+    raft_listen: SocketAddr,
+    /// Another node, as `ID=RAFT_ADDR[@CLIENT_ADDR]`; repeat it for every one
+    /// (`raft` backend). The client address is returned as the leader hint.
+    #[arg(long = "peer", env = "QUORID_PEERS", value_delimiter = ',')]
+    peers: Vec<Peer>,
     /// IDs leased from the backend per round trip.
     #[arg(long, env = "QUORID_BLOCK_SIZE", default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
     block_size: u64,
@@ -62,6 +79,8 @@ enum BackendKind {
     Memory,
     /// Durable single node.
     File,
+    /// Durable and replicated, on LumenDB's Raft. Only the leader takes writes.
+    Raft,
 }
 
 #[tokio::main]
@@ -86,6 +105,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve(args) => match args.backend {
             BackendKind::Memory => serve(MemoryBackend::new(), args).await,
             BackendKind::File => serve(FileBackend::open(&args.data_dir)?, args).await,
+            BackendKind::Raft => {
+                let config = raft_config(&args)?;
+                serve(RaftBackend::open(args.data_dir.join("raft"), config)?, args).await
+            }
         },
         Command::Encode { id, format, padded } => {
             println!("{}", format.encode(id, padded));
@@ -99,6 +122,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+fn raft_config(args: &ServeArgs) -> Result<RaftConfig, &'static str> {
+    let node_id = args
+        .node_id
+        .ok_or("the raft backend needs --node-id and --voters")?;
+    let mut config = RaftConfig::new(node_id, args.raft_listen, args.voters.clone());
+    config.peers = args.peers.clone();
+    Ok(config)
 }
 
 async fn serve<B: Backend>(backend: B, args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {

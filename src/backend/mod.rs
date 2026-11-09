@@ -5,15 +5,18 @@
 //!
 //! * [`MemoryBackend`]: single process, nothing persisted (tests, demos).
 //! * [`FileBackend`]: single node, every reservation fsync'd to disk.
+//! * [`RaftBackend`]: replicated and durable, on the Raft implementation of
+//!   [LumenDB](https://github.com/juanmaneo/LumenDB).
 //!
-//! A replicated backend (e.g. Raft) implements the same trait: serialize the
-//! command with [`Command::to_bytes`], propose it to the log, and once the
-//! entry is committed apply it to the local [`IdState`](crate::IdState) with
+//! A replicated backend implements the same trait: propose the command to the
+//! log, and once the entry is committed apply it to the local
+//! [`IdState`](crate::IdState) with
 //! [`IdState::apply`](crate::IdState::apply) and resolve the caller's future
-//! with the outcome.
+//! with the outcome. [`RaftBackend`] is the reference for that.
 
 mod file;
 mod memory;
+mod raft;
 
 use std::future::Future;
 
@@ -24,6 +27,7 @@ use crate::error::Result;
 
 pub use file::FileBackend;
 pub use memory::MemoryBackend;
+pub use raft::{Peer, RaftBackend, RaftConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

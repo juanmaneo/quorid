@@ -30,7 +30,9 @@ pub mod server;
 pub mod state;
 
 pub use allocator::{Allocator, AllocatorConfig};
-pub use backend::{Backend, BackendStatus, FileBackend, MemoryBackend, Role};
+pub use backend::{
+    Backend, BackendStatus, FileBackend, MemoryBackend, Peer, RaftBackend, RaftConfig, Role,
+};
 pub use codec::{AlphabetCodec, Codec, DecodeError, Format};
 pub use command::{Command, Outcome};
 pub use error::{Error, Result};

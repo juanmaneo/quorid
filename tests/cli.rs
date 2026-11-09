@@ -9,7 +9,17 @@ fn quorid() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_quorid"));
     // Plain logs at the default level, whatever the developer's environment says.
     cmd.env("NO_COLOR", "1").env_remove("RUST_LOG");
-    for var in ["LISTEN", "BACKEND", "DATA_DIR", "BLOCK_SIZE", "FORMAT"] {
+    for var in [
+        "LISTEN",
+        "BACKEND",
+        "DATA_DIR",
+        "BLOCK_SIZE",
+        "FORMAT",
+        "NODE_ID",
+        "VOTERS",
+        "RAFT_LISTEN",
+        "PEERS",
+    ] {
         cmd.env_remove(format!("QUORID_{var}"));
     }
     cmd
@@ -80,6 +90,55 @@ fn serve_fails_on_busy_port() {
     assert!(stderr.starts_with("error: "), "{stderr}");
 }
 
+#[test]
+fn serve_raft_needs_a_node_id() {
+    let out = run(&["serve", "--backend", "raft", "--voters", "1"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.starts_with("error: the raft backend needs --node-id and --voters"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn serve_raft_needs_this_node_among_the_voters() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().to_str().unwrap();
+    for voters in [[].as_slice(), ["--voters", "2,3"].as_slice()] {
+        let out = quorid()
+            .args([
+                "serve",
+                "--backend",
+                "raft",
+                "--node-id",
+                "1",
+                "--data-dir",
+                data,
+            ])
+            .args(voters)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.starts_with("error: invalid request: this node is not one of the voters"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn serve_raft_rejects_a_malformed_peer() {
+    let out = run(&["serve", "--backend", "raft", "--peer", "2"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("expected ID=RAFT_ADDR[@CLIENT_ADDR], got \"2\""),
+        "{stderr}"
+    );
+}
+
 /// A running `quorid serve`, killed on drop if a test fails midway.
 struct Server {
     child: Child,
@@ -125,6 +184,20 @@ impl Server {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
+    }
+
+    /// Posts until the node accepts writes: a Raft node first has to find or
+    /// become the leader, and answers `421 not_leader` meanwhile.
+    fn post_when_ready(&self, path: &str) -> String {
+        let start = std::time::Instant::now();
+        loop {
+            let response = self.post(path);
+            if !response.starts_with("HTTP/1.1 421") {
+                return response;
+            }
+            assert!(start.elapsed().as_secs() < 30, "no leader: {response}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Stops the server like Ctrl-C would and returns its remaining logs.
@@ -186,5 +259,41 @@ fn serve_file_backend_survives_restart() {
             .post("/v1/ns/users/ids")
             .ends_with(r#""ids":["101"]}"#)
     );
+    server.interrupt();
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_raft_backend_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let args = [
+        "--backend",
+        "raft",
+        "--node-id",
+        "1",
+        "--voters",
+        "1",
+        "--raft-listen",
+        "127.0.0.1:0",
+        "--data-dir",
+        data.to_str().unwrap(),
+        "--format",
+        "decimal",
+        "--block-size",
+        "100",
+    ];
+
+    let server = Server::start(&args);
+    let response = server.post_when_ready("/v1/ns/users/ids");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with(r#""ids":["1"]}"#), "{response}");
+    server.interrupt();
+    assert!(data.join("raft").join("raft.state").exists());
+
+    // The first block was committed durably, so the restart starts after it.
+    let server = Server::start(&args);
+    let response = server.post_when_ready("/v1/ns/users/ids");
+    assert!(response.ends_with(r#""ids":["101"]}"#), "{response}");
     server.interrupt();
 }

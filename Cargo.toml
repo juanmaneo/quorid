@@ -10,10 +10,13 @@ repository = "https://github.com/juanmaneo/quorid"
 [dependencies]
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+# Raft consensus from LumenDB (https://github.com/juanmaneo/LumenDB), renamed so
+# that it cannot be confused with `backend::raft`. Cargo.lock pins the commit.
+lumen-raft = { package = "raft", git = "https://github.com/juanmaneo/LumenDB" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "net", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
