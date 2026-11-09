@@ -229,6 +229,18 @@ fn not_a_voter() -> Error {
     Error::InvalidRequest("this node is not one of the voters, check --node-id and --voters".into())
 }
 
+/// Seeds a node's election timeouts. Raft derives its generator from
+/// `(seed ^ id) | 1`, so with one seed shared by every node, ids that differ
+/// only in the lowest bit (2 and 3, 4 and 5...) draw identical timeouts and
+/// split the vote again and again after a leader fails. Hashing the id
+/// (SplitMix64) gives each node its own sequence.
+fn election_seed(node_id: NodeId) -> u64 {
+    let mut z = node_id.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 /// Raft errors that say nothing about leadership.
 fn convert(e: lumen_raft::Error) -> Error {
     match e {
@@ -254,7 +266,7 @@ impl RaftBackend {
             Config {
                 election_timeout_min: config.election_ticks.0,
                 election_timeout_max: config.election_ticks.1,
-
+                seed: election_seed(config.node_id),
                 ..Config::cluster(config.node_id, config.voters)
             },
             storage,
@@ -812,6 +824,14 @@ mod tests {
         let backend = RaftBackend::open(dir.path(), config(1, vec![1])).unwrap();
         let err = backend.error(lumen_raft::Error::Storage("disk".into()));
         assert_eq!(err.to_string(), "storage error: disk");
+    }
+
+    #[test]
+    fn every_node_draws_its_own_election_timeouts() {
+        // This is how Raft turns the configured seed into its generator.
+        let generators: std::collections::HashSet<u64> =
+            (1..=1000).map(|id| (election_seed(id) ^ id) | 1).collect();
+        assert_eq!(generators.len(), 1000);
     }
 
     #[test]
