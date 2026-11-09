@@ -45,8 +45,8 @@ $ curl -XPOST 'localhost:7070/v1/ns/users/ids?count=2&format=base62'
         |                  |                  |
         v                  v                  v
 +---------------+  +---------------+  +---------------+
-| MemoryBackend |  | FileBackend   |  | Raft backend  |
-| (volatile)    |  | (durable)     |  | (planned)     |
+| MemoryBackend |  | FileBackend   |  | RaftBackend   |
+| (volatile)    |  | (durable)     |  | (replicated)  |
 +-------+-------+  +-------+-------+  +-------+-------+
         |                  |                  |
         +------------------+------------------+
@@ -110,7 +110,38 @@ cargo run -- serve --block-size 10000 --format base32 --listen 0.0.0.0:7070
 ```
 
 Every flag has an env var: `QUORID_LISTEN`, `QUORID_BACKEND`,
-`QUORID_DATA_DIR`, `QUORID_BLOCK_SIZE`, `QUORID_FORMAT`. Logs via `RUST_LOG`.
+`QUORID_DATA_DIR`, `QUORID_BLOCK_SIZE`, `QUORID_FORMAT`, and for the `raft`
+backend `QUORID_NODE_ID`, `QUORID_VOTERS`, `QUORID_RAFT_LISTEN`,
+`QUORID_PEERS`. Logs via `RUST_LOG`.
+
+### Running a cluster
+
+The `raft` backend replicates the state over [LumenDB](https://github.com/juanmaneo/LumenDB)'s
+`raft` crate. Start one node per machine, with the same `--voters` everywhere
+and the other nodes as `--peer ID=RAFT_ADDR[@CLIENT_ADDR]`:
+
+```sh
+# on 10.0.0.1 (and likewise on the others, with their own --node-id)
+quorid serve --backend raft --node-id 1 --voters 1,2,3 \
+  --listen 0.0.0.0:7070 --raft-listen 0.0.0.0:7171 \
+  --peer 2=10.0.0.2:7171@10.0.0.2:7070 \
+  --peer 3=10.0.0.3:7171@10.0.0.3:7070
+```
+
+* The Raft log and snapshots live in `<data-dir>/raft`. A single node
+  (`--node-id 1 --voters 1`) is a valid cluster of one.
+* **Only the leader takes writes.** A follower answers `421 not_leader`, with
+  the leader's `CLIENT_ADDR` as the `leader` hint when the peer was given one
+  (`/v1/status` shows it too). Clients retry there. The `--peer` list may
+  include the node itself.
+* The voters are fixed on the command line: there is no membership change.
+* A block is committed after a majority has it on disk, so reserving one costs
+  a few ticks (20 ms each by default). The segment allocator pays that once
+  per `--block-size` IDs, not per ID.
+* The Raft transport has no authentication or encryption: use a trusted
+  network.
+* A node that cannot commit (it lost its majority, say) answers 503 after a
+  timeout. The block may still be committed later, which only skips IDs.
 
 ## HTTP API
 
@@ -139,7 +170,10 @@ Namespaces: 1–64 chars of `[a-z0-9_.-]`, starting with `[a-z0-9]`.
 |----------|:-------:|:----------:|---------------------------------------------|
 | `memory` | no      | no         | tests and demos                             |
 | `file`   | yes     | no         | atomic write + fsync per block, `LOCK` file |
-| Raft     | yes     | yes        | planned, e.g. on Lumen's `raft` crate       |
+| `raft`   | yes     | yes        | LumenDB's `raft` crate; leader-only writes  |
+
+The `raft` backend depends on LumenDB through git (`Cargo.lock` pins the
+commit), which `cargo publish` to crates.io does not accept.
 
 ### Writing a backend
 
@@ -150,10 +184,13 @@ pub trait Backend: Send + Sync + 'static {
 }
 ```
 
-A Raft backend: `command.to_bytes()` → propose → when the entry commits, decode
-it with `Command::from_bytes`, apply with `IdState::apply`, resolve the waiting
-caller. Followers return `Error::NotLeader { leader }` (or forward). Snapshots
-are `IdState::snapshot()` / `IdState::restore()`. Read the contract on
+`RaftBackend` (`src/backend/raft.rs`) is the reference for a replicated one:
+propose the command → when the entry commits, apply it with `IdState::apply`
+→ resolve the waiting caller. Followers return `Error::NotLeader { leader }`
+(or forward). Snapshots are `IdState::snapshot()` / `IdState::restore()`.
+Match a caller to its own entry with a unique tag (node, run, sequence) rather
+than the log index: after a leader change another command can sit at that
+index, and the wrong caller would get its range. Read the contract on
 `Backend` in `src/backend/mod.rs`, notably: a failed `execute` may still have
 been applied, and that's fine for IDs.
 
