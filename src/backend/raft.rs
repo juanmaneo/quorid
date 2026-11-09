@@ -276,11 +276,8 @@ impl RaftBackend {
         for peer in config.peers {
             backend.set_peer(peer);
         }
-        tracing::info!(
-            node = config.node_id,
-            raft = %backend.local_addr(),
-            "raft node started"
-        );
+        let raft = backend.local_addr();
+        tracing::info!(node = config.node_id, %raft, "raft node started");
         Ok(backend)
     }
 
@@ -671,37 +668,46 @@ mod tests {
         .await;
         assert_eq!(backend.status().leader, None);
         let err = backend.execute(reserve(1)).await.unwrap_err();
-        assert!(matches!(err, Error::NotLeader { leader: None }), "{err}");
+        assert_eq!(format!("{err:?}"), "NotLeader { leader: None }");
     }
 
     #[tokio::test]
     async fn leader_hints_come_from_the_peers_client_addresses() {
         let dir = tempfile::tempdir().unwrap();
         let backend = RaftBackend::open(dir.path(), config(1, vec![1])).unwrap();
-        let hint = |leader| match backend.error(lumen_raft::Error::NotLeader(leader)) {
-            Error::NotLeader { leader } => leader,
-            other => panic!("{other}"),
-        };
+        let hint = |leader| format!("{:?}", backend.error(lumen_raft::Error::NotLeader(leader)));
+        let unknown = "NotLeader { leader: None }";
         let mut other = peer(7, &backend);
-        assert_eq!(hint(Some(7)), None);
+        assert_eq!(hint(Some(7)), unknown);
 
         backend.set_peer(other.clone());
-        assert_eq!(hint(Some(7)), Some("node7:7070".to_string()));
-        assert_eq!(hint(None), None);
+        assert_eq!(hint(Some(7)), r#"NotLeader { leader: Some("node7:7070") }"#);
+        assert_eq!(hint(None), unknown);
 
         other.client_addr = None;
         backend.set_peer(other);
-        assert_eq!(hint(Some(7)), None);
+        assert_eq!(hint(Some(7)), unknown);
+    }
+
+    #[tokio::test]
+    async fn other_raft_errors_are_not_about_leadership() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = RaftBackend::open(dir.path(), config(1, vec![1])).unwrap();
+        let err = backend.error(lumen_raft::Error::Storage("disk".into()));
+        assert_eq!(err.to_string(), "storage error: disk");
     }
 
     #[test]
     fn raft_errors_become_quorid_errors() {
         use lumen_raft::Error as Raft;
-        assert!(matches!(convert(Raft::Storage("disk".into())), Error::Storage(m) if m == "disk"));
-        assert!(matches!(
-            convert(Raft::NotConfigured),
-            Error::InvalidRequest(_)
-        ));
+        assert_eq!(
+            convert(Raft::Storage("disk".into())).to_string(),
+            "storage error: disk"
+        );
+        assert_eq!(
+            convert(Raft::NotConfigured).to_string(),
+            "invalid request: this node is not one of the voters, check --node-id and --voters"
+        );
         let err = convert(Raft::Timeout).to_string();
         assert_eq!(err, "backend unavailable: raft: timed out");
     }
