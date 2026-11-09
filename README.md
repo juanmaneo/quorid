@@ -17,20 +17,44 @@ $ curl -XPOST 'localhost:7070/v1/ns/users/ids?count=2&format=base62'
 
 ## How it works
 
-```mermaid
-flowchart TD
-    C[Clients] -->|POST /v1/ns/users/ids| S1[quorid server A]
-    C --> S2[quorid server B]
-    S1 --> A1[Allocator: blocks in memory]
-    S2 --> A2[Allocator: blocks in memory]
-    A1 -->|Reserve users, 1000| BK[Backend trait]
-    A2 -->|Reserve users, 1000| BK
-    BK --> M[MemoryBackend]
-    BK --> F[FileBackend]
-    BK --> R[Raft backend - planned]
-    R --> SM[IdState: next free id per namespace]
-    F --> SM
-    M --> SM
+```text
+                        Clients
+                           |
+                 POST /v1/ns/users/ids
+                           |
+               +-----------+-----------+
+               |                       |
+               v                       v
+     +-------------------+   +-------------------+
+     | quorid server A   |   | quorid server B   |
+     +-------------------+   +-------------------+
+     | Allocator:        |   | Allocator:        |
+     | blocks in memory  |   | blocks in memory  |
+     +---------+---------+   +---------+---------+
+               |                       |
+               +-----------+-----------+
+                           |
+                 Reserve(users, 1000)
+                           |
+                           v
+                   +---------------+
+                   | Backend trait |
+                   +-------+-------+
+                           |
+        +------------------+------------------+
+        |                  |                  |
+        v                  v                  v
++---------------+  +---------------+  +---------------+
+| MemoryBackend |  | FileBackend   |  | Raft backend  |
+| (volatile)    |  | (durable)     |  | (planned)     |
++-------+-------+  +-------+-------+  +-------+-------+
+        |                  |                  |
+        +------------------+------------------+
+                           |
+                           v
+        +-------------------------------------+
+        | IdState: next free ID per namespace |
+        +-------------------------------------+
 ```
 
 * **State machine** (`IdState`): for each namespace, the next free ID. The only
