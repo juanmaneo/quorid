@@ -58,6 +58,12 @@ struct ServeArgs {
     /// (`raft` backend, required).
     #[arg(long, env = "QUORID_VOTERS", value_delimiter = ',')]
     voters: Vec<u64>,
+    /// Start as a node that is going to be added to a running cluster, which
+    /// tells it who the voters are: instead of `--voters`, and with `--peer`
+    /// for the nodes of that cluster (`raft` backend). Restart an added node
+    /// the same way.
+    #[arg(long, env = "QUORID_JOIN")]
+    join: bool,
     /// Address of the Raft transport (`raft` backend).
     #[arg(long, env = "QUORID_RAFT_LISTEN", default_value = "127.0.0.1:7171")]
     raft_listen: SocketAddr,
@@ -79,7 +85,8 @@ enum BackendKind {
     Memory,
     /// Durable single node.
     File,
-    /// Durable and replicated, on LumenDB's Raft. Only the leader takes writes.
+    /// Durable and replicated, on LumenDB's Raft. Followers forward writes to
+    /// the leader.
     Raft,
 }
 
@@ -127,8 +134,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 fn raft_config(args: &ServeArgs) -> Result<RaftConfig, &'static str> {
     let node_id = args
         .node_id
-        .ok_or("the raft backend needs --node-id and --voters")?;
+        .ok_or("the raft backend needs --node-id, and --voters or --join")?;
     let mut config = RaftConfig::new(node_id, args.raft_listen, args.voters.clone());
+    config.join = args.join;
     config.peers = args.peers.clone();
     Ok(config)
 }

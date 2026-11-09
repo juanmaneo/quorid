@@ -78,7 +78,7 @@ fn serve_raft_needs_a_node_id() {
     assert!(!out.status.success());
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stderr.starts_with("error: the raft backend needs --node-id and --voters"),
+        stderr.starts_with("error: the raft backend needs --node-id, and --voters or --join"),
         "{stderr}"
     );
 }
@@ -108,6 +108,22 @@ fn serve_raft_needs_this_node_among_the_voters() {
             "{stderr}"
         );
     }
+}
+
+#[test]
+fn serve_raft_joins_without_voters_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = quorid()
+        .args(["serve", "--backend", "raft", "--node-id", "1", "--join"])
+        .args(["--voters", "1", "--data-dir", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.starts_with("error: invalid request: a node that joins takes no voters"),
+        "{stderr}"
+    );
 }
 
 #[test]

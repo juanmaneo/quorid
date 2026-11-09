@@ -17,6 +17,9 @@
 //! [`Error::NotLeader`](crate::Error::NotLeader) or forwards the command to the
 //! node that can, in which case it must serve forwarded commands with
 //! [`Backend::execute_here`].
+//!
+//! A backend whose cluster can change implements [`Backend::add_voter`] and
+//! [`Backend::remove_voter`]; the others refuse them.
 
 mod file;
 mod forward;
@@ -28,7 +31,7 @@ use std::future::Future;
 use serde::Serialize;
 
 use crate::command::{Command, Outcome};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 pub use file::FileBackend;
 pub use memory::MemoryBackend;
@@ -54,6 +57,26 @@ pub struct BackendStatus {
     pub node_id: Option<String>,
     /// Where writes should go when this node is not the leader.
     pub leader: Option<String>,
+    /// Who is in the cluster, for the backends that have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members: Option<Members>,
+}
+
+/// The membership of a cluster, as one node sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Members {
+    /// The nodes that vote, ascending: the last configuration this node holds,
+    /// committed or not.
+    pub voters: Vec<u64>,
+    /// The nodes the leader brings up to date before they vote (empty on the
+    /// others).
+    pub learners: Vec<u64>,
+    /// A change of the voters is under way: it is not committed yet.
+    pub config_pending: bool,
+}
+
+fn no_members() -> Error {
+    Error::InvalidRequest("this backend has no cluster to change".into())
 }
 
 /// A linearizable executor of [`Command`]s over the replicated ID state.
@@ -80,6 +103,20 @@ pub trait Backend: Send + Sync + 'static {
     /// Backends that never forward need not override it.
     fn execute_here(&self, command: Command) -> impl Future<Output = Result<Outcome>> + Send {
         self.execute(command)
+    }
+
+    /// Makes `peer` a voter of the cluster, once it has caught up, and returns
+    /// the membership then. The node has to be running already, and to know
+    /// where to reach the cluster.
+    fn add_voter(&self, peer: Peer) -> impl Future<Output = Result<Members>> + Send {
+        let _ = peer;
+        std::future::ready(Err(no_members()))
+    }
+
+    /// Stops node `id` from voting, and returns the membership then.
+    fn remove_voter(&self, id: u64) -> impl Future<Output = Result<Members>> + Send {
+        let _ = id;
+        std::future::ready(Err(no_members()))
     }
 
     fn status(&self) -> BackendStatus;

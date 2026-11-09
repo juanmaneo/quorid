@@ -40,6 +40,7 @@ impl Backend for MemoryBackend {
             durable: false,
             node_id: None,
             leader: None,
+            members: None,
         }
     }
 }

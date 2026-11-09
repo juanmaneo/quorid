@@ -20,6 +20,7 @@ pub fn quorid() -> Command {
         "FORMAT",
         "NODE_ID",
         "VOTERS",
+        "JOIN",
         "RAFT_LISTEN",
         "PEERS",
     ] {
@@ -30,11 +31,20 @@ pub fn quorid() -> Command {
 
 /// Sends one request and returns the whole raw response.
 pub fn http(addr: &str, method: &str, path: &str) -> String {
-    http_with(addr, method, path, &[])
+    send(addr, method, path, &[], "")
 }
 
 /// Like [`http`], with extra headers.
 pub fn http_with(addr: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> String {
+    send(addr, method, path, headers, "")
+}
+
+/// Like [`http`], with a body.
+pub fn http_body(addr: &str, method: &str, path: &str, body: &str) -> String {
+    send(addr, method, path, &[], body)
+}
+
+fn send(addr: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> String {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
@@ -45,7 +55,8 @@ pub fn http_with(addr: &str, method: &str, path: &str, headers: &[(&str, &str)])
         .collect();
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n{headers}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+        body.len(),
     )
     .unwrap();
     let mut response = String::new();

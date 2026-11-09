@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use common::{Server, http, http_with, split};
+use common::{Server, http, http_body, http_with, split};
 use serde_json::Value;
 
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -21,9 +21,19 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Nodes `1..=size` of one cluster, each with the same flags after a restart.
+fn addrs() -> (String, String) {
+    (
+        format!("127.0.0.1:{}", free_port()),
+        format!("127.0.0.1:{}", free_port()),
+    )
+}
+
+/// Nodes `1..=size` of one cluster, each with the same flags after a restart,
+/// and the nodes added to it later, which join instead of having voters.
 struct Cluster {
     dir: tempfile::TempDir,
+    /// How many nodes the cluster started with.
+    size: usize,
     /// `(client address, Raft address)` of every node.
     addrs: Vec<(String, String)>,
     nodes: Vec<Option<Server>>,
@@ -31,17 +41,10 @@ struct Cluster {
 
 impl Cluster {
     fn start(size: usize) -> Cluster {
-        let addrs = (0..size)
-            .map(|_| {
-                (
-                    format!("127.0.0.1:{}", free_port()),
-                    format!("127.0.0.1:{}", free_port()),
-                )
-            })
-            .collect();
         let mut cluster = Cluster {
             dir: tempfile::tempdir().unwrap(),
-            addrs,
+            size,
+            addrs: (0..size).map(|_| addrs()).collect(),
             nodes: Vec::new(),
         };
         for id in 1..=size {
@@ -51,20 +54,35 @@ impl Cluster {
         cluster
     }
 
+    /// Starts one more node, which waits to be added to the cluster.
+    fn start_joiner(&mut self) -> usize {
+        self.addrs.push(addrs());
+        let id = self.addrs.len();
+        let node = self.spawn(id);
+        self.nodes.push(Some(node));
+        id
+    }
+
+    /// The JSON that adds node `id` through the API.
+    fn describe(&self, id: usize) -> String {
+        let (client, raft) = &self.addrs[id - 1];
+        format!(r#"{{"id":{id},"raft_addr":"{raft}","client_addr":"{client}"}}"#)
+    }
+
     fn spawn(&self, id: usize) -> Server {
         let (client, raft) = &self.addrs[id - 1];
-        let voters = (1..=self.addrs.len())
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let voters = if id > self.size {
+            vec!["--join".to_string()]
+        } else {
+            let voters = (1..=self.size).map(|id| id.to_string());
+            vec!["--voters".to_string(), voters.collect::<Vec<_>>().join(",")]
+        };
         let data = self.dir.path().join(format!("node{id}"));
         let mut args = vec![
             "--backend".to_string(),
             "raft".into(),
             "--node-id".into(),
             id.to_string(),
-            "--voters".into(),
-            voters,
             "--raft-listen".into(),
             raft.clone(),
             "--data-dir".into(),
@@ -74,6 +92,7 @@ impl Cluster {
             "--format".into(),
             "decimal".into(),
         ];
+        args.extend(voters);
         for (i, (client, raft)) in self.addrs.iter().enumerate() {
             if i + 1 != id {
                 args.push("--peer".into());
@@ -284,4 +303,114 @@ fn a_node_that_lost_its_majority_does_not_serve() {
     assert_eq!(ids, [2, 3, 4, 5, 6]);
     let (code, _) = allocate(cluster.client_addr(leader), 20).unwrap_err();
     assert_eq!(code, 503);
+}
+
+/// The ids of the voters that `addr` knows of.
+fn voters(addr: &str) -> Vec<u64> {
+    status(addr)["backend"]["members"]["voters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_u64().unwrap())
+        .collect()
+}
+
+/// Calls the cluster API of `addr`, and returns what it answered.
+fn change(addr: &str, method: &str, path: &str, body: &str) -> (u16, Value) {
+    let response = http_body(addr, method, path, body);
+    let (code, body) = split(&response);
+    (code, serde_json::from_str(body).unwrap())
+}
+
+fn wait_for_voters(addr: &str, wanted: &[u64]) {
+    let start = Instant::now();
+    while voters(addr) != wanted {
+        assert!(
+            start.elapsed() < DEADLINE,
+            "the voters of {addr} are not {wanted:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_cluster_takes_in_a_node_and_lets_one_go() {
+    let mut cluster = Cluster::start(3);
+    let mut issued = Issued::default();
+
+    let leader = cluster.wait_for_leader();
+    cluster.wait_for_followers(leader);
+    let ids = allocate(cluster.client_addr(leader), 3).unwrap();
+    issued.add(&ids);
+
+    // A fourth node starts, and waits to be told it is one of the cluster.
+    let joiner = cluster.start_joiner();
+    assert_eq!(joiner, 4);
+    let node = cluster.describe(joiner);
+    let follower = (1..=3).find(|&id| id != leader).unwrap();
+    let (code, body) = change(
+        cluster.client_addr(follower),
+        "POST",
+        "/v1/cluster/voters",
+        &node,
+    );
+    assert_eq!(code, 421);
+    assert_eq!(body["leader"], cluster.client_addr(leader));
+
+    let (code, body) = change(
+        cluster.client_addr(leader),
+        "POST",
+        "/v1/cluster/voters",
+        &node,
+    );
+    assert_eq!(
+        (code, &body["voters"]),
+        (200, &serde_json::json!([1, 2, 3, 4]))
+    );
+    let (code, body) = change(
+        cluster.client_addr(leader),
+        "POST",
+        "/v1/cluster/voters",
+        &node,
+    );
+    assert_eq!(code, 400);
+    assert_eq!(
+        body["message"],
+        "invalid request: node 4 is already a voter"
+    );
+
+    // It follows, serves through the leader, and still does after a restart.
+    wait_for_voters(cluster.client_addr(joiner), &[1, 2, 3, 4]);
+    cluster.wait_for_followers(leader);
+    let ids = allocate(cluster.client_addr(joiner), 5).unwrap();
+    assert!(issued.after(&ids), "{ids:?}");
+    issued.add(&ids);
+    cluster.kill(joiner);
+    cluster.restart(joiner);
+    wait_for_voters(cluster.client_addr(joiner), &[1, 2, 3, 4]);
+    cluster.wait_for_followers(leader);
+    let ids = allocate(cluster.client_addr(joiner), 5).unwrap();
+    assert!(issued.after(&ids), "{ids:?}");
+    issued.add(&ids);
+
+    // Three of the four are a majority: the cluster outlives its leader,
+    // which is then taken out so that the rest does not wait for it.
+    cluster.kill(leader);
+    let second = cluster.wait_for_leader();
+    let ids = allocate(cluster.client_addr(second), 15).unwrap();
+    assert!(issued.after(&ids), "{ids:?}");
+    issued.add(&ids);
+    let path = format!("/v1/cluster/voters/{leader}");
+    let (code, body) = change(cluster.client_addr(second), "DELETE", &path, "");
+    let rest: Vec<u64> = (1..=4).filter(|&id| id != leader as u64).collect();
+    assert_eq!((code, &body["voters"]), (200, &serde_json::json!(rest)));
+    let (code, _) = change(cluster.client_addr(second), "DELETE", &path, "");
+    assert_eq!(code, 400);
+
+    for id in cluster.running().collect::<Vec<_>>() {
+        wait_for_voters(cluster.client_addr(id), &rest);
+        // Each node hands out what is left of its own block, so the IDs are
+        // unique but not in order across nodes.
+        issued.add(&allocate(cluster.client_addr(id), 1).unwrap());
+    }
 }

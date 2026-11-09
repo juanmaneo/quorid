@@ -109,6 +109,7 @@ impl Backend for FileBackend {
             durable: true,
             node_id: None,
             leader: None,
+            members: None,
         }
     }
 }

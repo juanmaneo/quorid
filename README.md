@@ -111,7 +111,7 @@ cargo run -- serve --block-size 10000 --format base32 --listen 0.0.0.0:7070
 
 Every flag has an env var: `QUORID_LISTEN`, `QUORID_BACKEND`,
 `QUORID_DATA_DIR`, `QUORID_BLOCK_SIZE`, `QUORID_FORMAT`, and for the `raft`
-backend `QUORID_NODE_ID`, `QUORID_VOTERS`, `QUORID_RAFT_LISTEN`,
+backend `QUORID_NODE_ID`, `QUORID_VOTERS`, `QUORID_JOIN`, `QUORID_RAFT_LISTEN`,
 `QUORID_PEERS`. Logs via `RUST_LOG`.
 
 ### Running a cluster
@@ -139,7 +139,9 @@ quorid serve --backend raft --node-id 1 --voters 1,2,3 \
   no leader yet or does not know the leader's `CLIENT_ADDR`; the `leader` hint
   of the 421 (also in `/v1/status`) tells clients where to retry. The `--peer`
   list may include the node itself.
-* The voters are fixed on the command line: there is no membership change.
+* `--voters` only starts a cluster. Afterwards the voters are changed through
+  the API (below) and live in the Raft log, which a restarted node trusts over
+  its command line.
 * A block is committed after a majority has it on disk, so reserving one costs
   a few ticks (20 ms each by default). The segment allocator pays that once
   per `--block-size` IDs, not per ID.
@@ -148,22 +150,67 @@ quorid serve --backend raft --node-id 1 --voters 1,2,3 \
 * A node that cannot commit (it lost its majority, say) answers 503 after a
   timeout. The block may still be committed later, which only skips IDs.
 
+#### Changing the cluster
+
+Start the new node first, as a node that waits to be told it is part of a
+cluster (`--join` instead of `--voters`), and with `--peer` for the nodes it
+has to reach:
+
+```sh
+# on 10.0.0.4
+quorid serve --backend raft --node-id 4 --join \
+  --listen 0.0.0.0:7070 --raft-listen 0.0.0.0:7171 \
+  --peer 1=10.0.0.1:7171@10.0.0.1:7070 \
+  --peer 2=10.0.0.2:7171@10.0.0.2:7070 \
+  --peer 3=10.0.0.3:7171@10.0.0.3:7070
+
+# then, on the leader, say where it lives (the addresses the others reach it at)
+curl -X POST http://10.0.0.1:7070/v1/cluster/voters \
+  -d '{"id":4,"raft_addr":"10.0.0.4:7171","client_addr":"10.0.0.4:7070"}'
+
+# and later, to take a node out (a dead one included)
+curl -X DELETE http://10.0.0.1:7070/v1/cluster/voters/3
+```
+
+Both answer with the new membership once the change is committed, and
+`/v1/status` shows it under `backend.members` (`voters`, `learners`, and
+`config_pending` while a change is under way).
+
+* Only the leader changes the cluster. Any other node answers `421
+  not_leader` with the leader as the hint: these calls are not forwarded.
+* The leader gives every node where the new one lives through the log (and the
+  snapshots), so they need no `--peer` for it. A node that is added keeps
+  `--join` when it restarts, and its voters come from its log.
+* The new node first receives the log as a learner, which does not count
+  toward any majority, and becomes a voter once it has caught up. If it does
+  not within the timeout (it is not running, say), the call fails with 503 and
+  the membership is as it was. One change is made at a time.
+* The leader may remove itself: it steps down once that is committed.
+* A change needs a majority, so this does not bring back a cluster that lost
+  one.
+* Do not give a node the ID of one that was removed, unless its data directory
+  is empty.
+
 ## HTTP API
 
 IDs are always JSON **strings**: JSON numbers can't carry 128 bits.
 
-| method | path                        | query                                   |
-|--------|-----------------------------|-----------------------------------------|
-| POST   | `/v1/ns/{namespace}/ids`    | `count` (1..=10000), `format`, `padded` |
-| POST   | `/v1/ns/{namespace}/blocks` | `size` (default: block size)            |
-| GET    | `/v1/decode/{value}`        | `format`                                |
-| GET    | `/v1/status`                |                                         |
-| GET    | `/healthz`                  |                                         |
+| method | path                        | query / body                                |
+|--------|-----------------------------|---------------------------------------------|
+| POST   | `/v1/ns/{namespace}/ids`    | `count` (1..=10000), `format`, `padded`     |
+| POST   | `/v1/ns/{namespace}/blocks` | `size` (default: block size)                |
+| GET    | `/v1/decode/{value}`        | `format`                                    |
+| GET    | `/v1/status`                |                                             |
+| GET    | `/healthz`                  |                                             |
+| POST   | `/v1/cluster/voters`        | JSON body: `id`, `raft_addr`, `client_addr` |
+| DELETE | `/v1/cluster/voters/{id}`   |                                             |
 
 `/blocks` hands a raw range (`{"start":"101","end":"1000101",...}`, half-open)
 to clients that want to allocate locally themselves. On a replicated backend a
 follower forwards it to the leader, unless the request has the
-`x-quorid-forwarded` header (see above).
+`x-quorid-forwarded` header (see above). The `/v1/cluster/voters` calls
+change the cluster of a replicated backend (see "Changing the cluster"); the
+others answer 400 `invalid_request`.
 
 Errors are `{"error": "...", "message": "..."}` with status 400 (bad
 namespace/count/ID), 409 (namespace exhausted), 421 (`not_leader`, with a
@@ -188,6 +235,8 @@ commit), which `cargo publish` to crates.io does not accept.
 pub trait Backend: Send + Sync + 'static {
     fn execute(&self, command: Command) -> impl Future<Output = Result<Outcome>> + Send;
     fn execute_here(&self, command: Command) -> impl Future<Output = Result<Outcome>> + Send; // defaults to execute
+    fn add_voter(&self, peer: Peer) -> impl Future<Output = Result<Members>> + Send; // defaults to a refusal
+    fn remove_voter(&self, id: u64) -> impl Future<Output = Result<Members>> + Send; // likewise
     fn status(&self) -> BackendStatus;
 }
 ```

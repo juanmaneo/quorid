@@ -7,6 +7,8 @@
 //! | GET    | `/v1/decode/{value}`          | `?format=mania`, shows every encoding    |
 //! | GET    | `/v1/status`                  | backend and allocator info               |
 //! | GET    | `/healthz`                    | liveness                                 |
+//! | POST   | `/v1/cluster/voters`          | add a node as a voter (JSON body)        |
+//! | DELETE | `/v1/cluster/voters/{id}`     | remove a voter                           |
 //!
 //! IDs are always JSON strings: JSON numbers cannot carry 128-bit integers.
 //!
@@ -17,15 +19,16 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::allocator::{Allocator, AllocatorConfig};
-use crate::backend::{Backend, BackendStatus};
+use crate::backend::{Backend, BackendStatus, Members, Peer};
 use crate::codec::{DecodeError, Format};
 use crate::error::Error;
 use crate::id::{IdRange, Namespace};
@@ -56,6 +59,8 @@ pub fn router<B: Backend>(allocator: Arc<Allocator<B>>, default_format: Format) 
         .route("/v1/ns/{namespace}/ids", post(allocate_ids::<B>))
         .route("/v1/ns/{namespace}/blocks", post(lease_block::<B>))
         .route("/v1/decode/{value}", get(decode::<B>))
+        .route("/v1/cluster/voters", post(add_voter::<B>))
+        .route("/v1/cluster/voters/{id}", delete(remove_voter::<B>))
         .route("/v1/status", get(status::<B>))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(AppState {
@@ -166,6 +171,28 @@ async fn decode<B: Backend>(
             .map(|&f| (f, f.encode(id, false)))
             .collect(),
     }))
+}
+
+/// Adds the node described by the JSON body, `{"id": 4, "raft_addr":
+/// "10.0.0.4:7171", "client_addr": "10.0.0.4:7070"}`: the same as `--peer`
+/// takes. Only the leader does it; the others answer 421 with the leader.
+async fn add_voter<B: Backend>(
+    State(state): State<AppState<B>>,
+    body: Bytes,
+) -> Result<Json<Members>, ApiError> {
+    let peer: Peer = serde_json::from_slice(&body)
+        .map_err(|e| Error::InvalidRequest(format!("the body is not a node: {e}")))?;
+    Ok(Json(state.allocator.backend().add_voter(peer).await?))
+}
+
+async fn remove_voter<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+) -> Result<Json<Members>, ApiError> {
+    let id = id
+        .parse()
+        .map_err(|_| Error::InvalidRequest(format!("{id:?} is not a node ID")))?;
+    Ok(Json(state.allocator.backend().remove_voter(id).await?))
 }
 
 #[derive(Serialize)]
@@ -344,9 +371,101 @@ mod tests {
             })
         }
 
+        /// Says what it was asked, for the test to see it arrive.
+        async fn add_voter(&self, peer: Peer) -> crate::error::Result<Members> {
+            Ok(Members {
+                voters: vec![peer.id],
+                learners: peer.client_addr.iter().map(|_| 0).collect(),
+                config_pending: false,
+            })
+        }
+
+        async fn remove_voter(&self, id: u64) -> crate::error::Result<Members> {
+            Ok(Members {
+                voters: Vec::new(),
+                learners: vec![id],
+                config_pending: true,
+            })
+        }
+
         fn status(&self) -> BackendStatus {
             MemoryBackend::new().status()
         }
+    }
+
+    async fn send(app: &Router, method: Method, uri: &str, body: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_cluster_is_changed_through_the_backend() {
+        let allocator = Allocator::new(Arc::new(Follower), AllocatorConfig::with_block_size(100));
+        let app = router(Arc::new(allocator), Format::Mania);
+        let voters = "/v1/cluster/voters";
+
+        let node = r#"{"id":4,"raft_addr":"10.0.0.4:7171","client_addr":"10.0.0.4:7070"}"#;
+        let (status, body) = send(&app, Method::POST, voters, node).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["voters"], serde_json::json!([4]));
+        assert_eq!(body["learners"], serde_json::json!([0]));
+        // The client address is optional.
+        let node = r#"{"id":5,"raft_addr":"10.0.0.5:7171"}"#;
+        let (status, body) = send(&app, Method::POST, voters, node).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["voters"], serde_json::json!([5]));
+        assert_eq!(body["learners"], serde_json::json!([]));
+
+        let (status, body) = send(&app, Method::POST, voters, "nope").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_request");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.starts_with("invalid request: the body is not a node: "));
+
+        let (status, body) = send(&app, Method::DELETE, "/v1/cluster/voters/3", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["learners"], serde_json::json!([3]));
+        assert_eq!(body["config_pending"], true);
+        let (status, body) = send(&app, Method::DELETE, "/v1/cluster/voters/x", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["message"], "invalid request: \"x\" is not a node ID");
+    }
+
+    #[tokio::test]
+    async fn backends_without_a_cluster_refuse_to_change_it() {
+        let app = app();
+        let node = r#"{"id":4,"raft_addr":"10.0.0.4:7171"}"#;
+        let (status, body) = send(&app, Method::POST, "/v1/cluster/voters", node).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["message"],
+            "invalid request: this backend has no cluster to change"
+        );
+        let (status, _) = send(&app, Method::DELETE, "/v1/cluster/voters/1", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // What is wrong with the request is said first.
+        let (_, body) = send(&app, Method::POST, "/v1/cluster/voters", "{}").await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("the body is not a node")
+        );
+        let (_, body) = send(&app, Method::DELETE, "/v1/cluster/voters/x", "").await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("is not a node ID")
+        );
     }
 
     async fn forwarded(app: &Router, uri: &str) -> (StatusCode, Value) {
@@ -411,6 +530,7 @@ mod tests {
         let (status, body) = call(&app, Method::GET, "/v1/status").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["backend"]["kind"], "memory");
+        assert!(body["backend"].get("members").is_none());
         assert_eq!(body["default_format"], "mania");
         assert_eq!(body["allocator"]["block_size"], 100);
     }
