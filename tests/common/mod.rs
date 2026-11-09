@@ -23,6 +23,7 @@ pub fn quorid() -> Command {
         "JOIN",
         "RAFT_LISTEN",
         "PEERS",
+        "TIMEOUT",
     ] {
         cmd.env_remove(format!("QUORID_{var}"));
     }

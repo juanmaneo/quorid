@@ -112,7 +112,7 @@ cargo run -- serve --block-size 10000 --format base32 --listen 0.0.0.0:7070
 Every flag has an env var: `QUORID_LISTEN`, `QUORID_BACKEND`,
 `QUORID_DATA_DIR`, `QUORID_BLOCK_SIZE`, `QUORID_FORMAT`, and for the `raft`
 backend `QUORID_NODE_ID`, `QUORID_VOTERS`, `QUORID_JOIN`, `QUORID_RAFT_LISTEN`,
-`QUORID_PEERS`. Logs via `RUST_LOG`.
+`QUORID_PEERS`, `QUORID_TIMEOUT`. Logs via `RUST_LOG`.
 
 ### Running a cluster
 
@@ -149,6 +149,9 @@ quorid serve --backend raft --node-id 1 --voters 1,2,3 \
   network.
 * A node that cannot commit (it lost its majority, say) answers 503 after a
   timeout. The block may still be committed later, which only skips IDs.
+* `--timeout` is that timeout, in seconds (5 by default). It also bounds a
+  follower's request to the leader and a change of the cluster, so give every
+  node the same value.
 
 #### Changing the cluster
 
@@ -183,8 +186,9 @@ Both answer with the new membership once the change is committed, and
   `--join` when it restarts, and its voters come from its log.
 * The new node first receives the log as a learner, which does not count
   toward any majority, and becomes a voter once it has caught up. If it does
-  not within the timeout (it is not running, say), the call fails with 503 and
-  the membership is as it was. One change is made at a time.
+  not within `--timeout` (it is not running, say, or its state is big and the
+  link slow: raise the timeout of the leader), the call fails with 503 and the
+  membership is as it was. One change is made at a time.
 * The leader may remove itself: it steps down once that is committed.
 * A change needs a majority, so this does not bring back a cluster that lost
   one.

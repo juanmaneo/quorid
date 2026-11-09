@@ -127,6 +127,16 @@ fn serve_raft_joins_without_voters_only() {
 }
 
 #[test]
+fn serve_raft_rejects_a_timeout_of_nothing() {
+    for timeout in ["0", "soon"] {
+        let out = run(&["serve", "--backend", "raft", "--timeout", timeout]);
+        assert_eq!(out.status.code(), Some(2));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("invalid value"), "{stderr}");
+    }
+}
+
+#[test]
 fn serve_raft_rejects_a_malformed_peer() {
     let out = run(&["serve", "--backend", "raft", "--peer", "2"]);
     assert_eq!(out.status.code(), Some(2));

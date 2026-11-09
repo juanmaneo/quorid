@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use quorid::{
@@ -71,6 +72,11 @@ struct ServeArgs {
     /// (`raft` backend). The client address is returned as the leader hint.
     #[arg(long = "peer", env = "QUORID_PEERS", value_delimiter = ',')]
     peers: Vec<Peer>,
+    /// Seconds a write may take to commit, and a change of the cluster to
+    /// finish, which includes a new node catching up (`raft` backend). Raise
+    /// it for a big state or a slow link.
+    #[arg(long, env = "QUORID_TIMEOUT", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout: u64,
     /// IDs leased from the backend per round trip.
     #[arg(long, env = "QUORID_BLOCK_SIZE", default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
     block_size: u64,
@@ -138,6 +144,7 @@ fn raft_config(args: &ServeArgs) -> Result<RaftConfig, &'static str> {
     let mut config = RaftConfig::new(node_id, args.raft_listen, args.voters.clone());
     config.join = args.join;
     config.peers = args.peers.clone();
+    config.timeout = Duration::from_secs(args.timeout);
     Ok(config)
 }
 

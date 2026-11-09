@@ -36,15 +36,22 @@ struct Cluster {
     size: usize,
     /// `(client address, Raft address)` of every node.
     addrs: Vec<(String, String)>,
+    /// Flags of every node, besides the ones that make it part of the cluster.
+    flags: Vec<&'static str>,
     nodes: Vec<Option<Server>>,
 }
 
 impl Cluster {
     fn start(size: usize) -> Cluster {
+        Cluster::start_with(size, &[])
+    }
+
+    fn start_with(size: usize, flags: &[&'static str]) -> Cluster {
         let mut cluster = Cluster {
             dir: tempfile::tempdir().unwrap(),
             size,
             addrs: (0..size).map(|_| addrs()).collect(),
+            flags: flags.to_vec(),
             nodes: Vec::new(),
         };
         for id in 1..=size {
@@ -93,6 +100,7 @@ impl Cluster {
             "decimal".into(),
         ];
         args.extend(voters);
+        args.extend(self.flags.iter().map(ToString::to_string));
         for (i, (client, raft)) in self.addrs.iter().enumerate() {
             if i + 1 != id {
                 args.push("--peer".into());
@@ -303,6 +311,40 @@ fn a_node_that_lost_its_majority_does_not_serve() {
     assert_eq!(ids, [2, 3, 4, 5, 6]);
     let (code, _) = allocate(cluster.client_addr(leader), 20).unwrap_err();
     assert_eq!(code, 503);
+}
+
+#[test]
+fn writes_and_changes_give_up_after_the_timeout_that_was_asked_for() {
+    let mut cluster = Cluster::start_with(3, &["--timeout", "1"]);
+    let leader = cluster.wait_for_leader();
+    cluster.wait_for_followers(leader);
+    allocate(cluster.client_addr(leader), 1).unwrap();
+    for id in (1..=3).filter(|&id| id != leader) {
+        cluster.kill(id);
+    }
+
+    // Neither can commit without a majority. Both fail after the second they
+    // were given, not after the five of the default.
+    let (code, body) = allocate(cluster.client_addr(leader), 20).unwrap_err();
+    assert_eq!(code, 503);
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("did not commit within 1s"), "{message}");
+
+    let joiner = cluster.start_joiner();
+    let node = cluster.describe(joiner);
+    let start = Instant::now();
+    let (code, _) = change(
+        cluster.client_addr(leader),
+        "POST",
+        "/v1/cluster/voters",
+        &node,
+    );
+    assert_eq!(code, 503);
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        start.elapsed()
+    );
 }
 
 /// The ids of the voters that `addr` knows of.
